@@ -4,47 +4,14 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Download, CheckCircle2, AlertCircle, FileSpreadsheet, ArrowRight,
   Loader2, X, ShieldCheck, MapPin, User, Tag, RefreshCw,
-  Wand2, Split, CopyMinus, Stamp, ScrollText
+  Wand2, Split, CopyMinus, Stamp, ScrollText, BadgeCheck
 } from 'lucide-react';
-
-// --- CONFIGURAZIONE ---
-interface DemoColumn {
-  id: string;
-  label: string;
-  category: 'Anagrafica' | 'Contatti' | 'Indirizzo' | 'Dettagli';
-  requiredGroup?: string;
-  description?: string;
-  cleanType?: 'text' | 'phone' | 'email' | 'none';
-}
-
-const DEMO_COLUMNS: DemoColumn[] = [
-  // ANAGRAFICA
-  { id: 'nome', label: 'nome', category: 'Anagrafica', description: 'Nome (o Nome Completo se attivi Split)', cleanType: 'text' },
-  { id: 'cognome', label: 'cognome', category: 'Anagrafica', description: 'Cognome (lascia vuoto se usi Split)', cleanType: 'text' },
-  { id: 'data_nascita', label: 'data di nascita', category: 'Anagrafica', description: 'Formato: GG/MM/AAAA', cleanType: 'none' },
-
-  // CONTATTI
-  { id: 'email', label: 'email', category: 'Contatti', requiredGroup: 'contatto', description: 'Email personale/aziendale', cleanType: 'email' },
-  { id: 'telefono', label: 'telefono', category: 'Contatti', requiredGroup: 'contatto', description: 'Cellulare o fisso', cleanType: 'phone' },
-
-  // INDIRIZZO
-  { id: 'indirizzo', label: 'indirizzo', category: 'Indirizzo', description: 'Via e numero civico', cleanType: 'text' },
-  { id: 'citta', label: 'citta', category: 'Indirizzo', description: 'Città di residenza', cleanType: 'text' },
-  { id: 'cap', label: 'cap', category: 'Indirizzo', description: 'Codice Postale', cleanType: 'none' },
-  { id: 'provincia', label: 'provincia', category: 'Indirizzo', description: 'Provincia (es. RN)', cleanType: 'text' },
-  { id: 'nazione', label: 'nazione', category: 'Indirizzo', description: 'Nazione (es. Italia)', cleanType: 'text' },
-
-  // DETTAGLI
-  { id: 'note', label: 'note', category: 'Dettagli', description: 'Note libere aggiuntive', cleanType: 'none' },
-  { id: 'profilazione', label: 'profilazione', category: 'Dettagli', description: 'Campo custom per segmentazione', cleanType: 'none' },
-  { id: 'tags', label: 'tags', category: 'Dettagli', description: 'Etichette separate da virgola', cleanType: 'none' },
-];
-
-type Mapping = Record<string, string>;
+import { IMPORT_COLUMNS as DEMO_COLUMNS, autoMatch, processRows, toXlsxCells } from './importFormat';
+import type { Mapping, Row, OutRow, ImportStats } from './importFormat';
 
 export default function App() {
   const [step, setStep] = useState<1 | 2>(1);
-  const [fileData, setFileData] = useState<any[]>([]);
+  const [fileData, setFileData] = useState<Row[]>([]);
   const [userHeaders, setUserHeaders] = useState<string[]>([]);
   const [headerSamples, setHeaderSamples] = useState<Record<string, string>>({});
   const [mapping, setMapping] = useState<Mapping>({});
@@ -56,118 +23,22 @@ export default function App() {
   const [globalTag, setGlobalTag] = useState<string>("");
   const [defaultPrefix, setDefaultPrefix] = useState<string>("+39");
 
-  const [previewRows, setPreviewRows] = useState<any[]>([]);
+  const [previewRows, setPreviewRows] = useState<OutRow[]>([]);
   const [originalFileName, setOriginalFileName] = useState<string>("");
   const [customFileName, setCustomFileName] = useState<string>("");
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [showSuccessToast, setShowSuccessToast] = useState(false);
   const [encodingWarning, setEncodingWarning] = useState(false);
-  const [importStats, setImportStats] = useState({ totale: 0, duplicatiRimossi: 0, senzaContatto: 0 });
+  const [importStats, setImportStats] = useState<ImportStats>({ totale: 0, duplicatiRimossi: 0, senzaContatto: 0, dateNonValide: 0, consensiNonRiconosciuti: 0, emailNonValide: 0 });
 
-  // --- MOTORE DI PULIZIA DATI ---
-  const cleanValue = (value: any, type: string | undefined) => {
-    if (value === null || value === undefined) return "";
-    const str = String(value).trim();
-    if (str === "") return "";
-
-    if (!cleaningEnabled) return str;
-
-    switch (type) {
-      case 'text': {
-        // Particelle che in italiano restano minuscole quando non sono la
-        // prima parola (es. "Via delle Rose", "Di Stefano" è un cognome a sé
-        // e va bene capitalizzato, ma "de", "di", "della"... in mezzo a un
-        // indirizzo o nome composto no).
-        const lowerParticles = new Set(['de', 'di', 'da', 'lo', 'la', 'le', 'del', 'della', 'delle', 'dei', 'degli', 'van', 'von']);
-        const words = str.toLowerCase().split(' ');
-        return words.map((w, i) => {
-          if (i > 0 && lowerParticles.has(w)) return w;
-          return w.replace(/(?:^|['-])\S/g, (a) => a.toUpperCase());
-        }).join(' ');
-      }
-      case 'email': return str.toLowerCase();
-      case 'phone': {
-        let cleanPhone = str.replace(/[^0-9+]/g, '');
-        if (cleanPhone.startsWith('00')) cleanPhone = '+' + cleanPhone.substring(2);
-        if (cleanPhone.startsWith('+')) return cleanPhone;
-        // Applica il prefisso solo se la lunghezza è plausibile per un numero
-        // italiano (fisso o cellulare, 9-10 cifre). Sotto questa soglia è più
-        // probabile un interno, un numero parziale o un dato sporco: meglio
-        // lasciarlo invariato che "correggerlo" in modo sbagliato.
-        if (cleanPhone.length >= 9 && cleanPhone.length <= 10) return defaultPrefix + cleanPhone;
-        return cleanPhone;
-      }
-      default: return str;
-    }
-  };
-
-  // --- LOGICA CORE ELABORAZIONE RIGA ---
-  const processRow = (row: any, currentMapping: Mapping) => {
-    const newRow: any = {};
-
-    // Gestione Split Nome/Cognome
-    const splitParts = { nome: "", cognome: "" };
-    if (splitNameEnabled && currentMapping['nome'] && !currentMapping['cognome']) {
-      const fullName = row[currentMapping['nome']] || "";
-      const parts = String(fullName).trim().split(' ');
-      splitParts.nome = parts[0] || "";
-      splitParts.cognome = parts.slice(1).join(' ') || "";
-    }
-
-    DEMO_COLUMNS.forEach(col => {
-      let rawValue = "";
-
-      if (splitNameEnabled && col.id === 'nome' && splitParts.nome) {
-        rawValue = splitParts.nome;
-      } else if (splitNameEnabled && col.id === 'cognome' && splitParts.cognome) {
-        rawValue = splitParts.cognome;
-      } else {
-        const mappedHeader = currentMapping[col.id];
-        rawValue = mappedHeader ? row[mappedHeader] : "";
-      }
-
-      // Gestione Global Tag
-      if (col.id === 'tags' && globalTag) {
-        const existingTags = rawValue ? rawValue + ", " : "";
-        rawValue = existingTags + globalTag;
-      }
-
-      newRow[col.label] = cleanValue(rawValue, col.cleanType);
+  // --- ELABORAZIONE (logica in importFormat.ts) ---
+  const processAllData = (dataSource: Row[], currentMapping: Mapping) => {
+    const { rows, stats } = processRows(dataSource, currentMapping, {
+      cleaningEnabled, splitNameEnabled, deduplicateEnabled, globalTag, defaultPrefix,
     });
-
-    return newRow;
-  };
-
-  const processAllData = (dataSource: any[], currentMapping: Mapping) => {
-    let processed = dataSource.map(row => processRow(row, currentMapping));
-    let stats = { totale: processed.length, duplicatiRimossi: 0, senzaContatto: 0 };
-
-    // Gestione Deduplica
-    if (deduplicateEnabled) {
-      const uniqueMap = new Map();
-      let noContactCounter = 0;
-      processed.forEach(row => {
-        const key = row['email'] || row['telefono'];
-        if (key && key.length > 5) {
-          if (!uniqueMap.has(key)) {
-            uniqueMap.set(key, row);
-          } else {
-            stats.duplicatiRimossi++;
-          }
-        } else {
-           // Nessuna chiave di contatto valida: la riga viene mantenuta
-           // (non è un duplicato accertato) ma con una chiave univoca
-           // deterministica, più leggibile e debuggabile di un Math.random().
-           uniqueMap.set(`__no_contact_${noContactCounter++}`, row);
-           stats.senzaContatto++;
-        }
-      });
-      processed = Array.from(uniqueMap.values());
-    }
-
     setImportStats(stats);
-    return processed;
+    return rows;
   };
 
   // --- RILEVAMENTO ENCODING SOSPETTO ---
@@ -177,7 +48,7 @@ export default function App() {
   // un campione di valori in cerca di questi pattern, solo per avvisare
   // l'utente: non blocchiamo né correggiamo automaticamente, perché un fix
   // automatico sbagliato rischierebbe di rovinare dati già corretti.
-  const looksLikeMojibake = (rows: any[], headers: string[]) => {
+  const looksLikeMojibake = (rows: Row[], headers: string[]) => {
     const mojibakePattern = /Ã[\u0080-\u00BF]|Â[\u0080-\u00BF]|â€™|â€œ|â€/;
     let sampleCount = 0;
     for (const row of rows) {
@@ -200,23 +71,22 @@ export default function App() {
     setCustomFileName(file.name.split('.')[0]);
     const extension = file.name.split('.').pop()?.toLowerCase();
 
-    const parseCallback = (data: any[], headers: string[]) => {
+    const parseCallback = (data: Row[], headers: string[]) => {
       setTimeout(() => {
         setUserHeaders(headers);
         setFileData(data);
         setEncodingWarning(looksLikeMojibake(data, headers));
 
-        const firstRow = data.find(row => Object.values(row).some(v => v));
+        // Esempio per ogni colonna: primo valore non vuoto di quella colonna
         const samples: Record<string, string> = {};
-        if (firstRow) {
-          headers.forEach(h => {
-            const val = firstRow[h];
-            samples[h] = val ? String(val).substring(0, 15) + (String(val).length > 15 ? '...' : '') : '-';
-          });
-        }
+        headers.forEach(h => {
+          const row = data.find(r => r[h] !== undefined && String(r[h]).trim() !== '');
+          const val = row ? String(row[h]) : '';
+          samples[h] = val ? val.substring(0, 15) + (val.length > 15 ? '...' : '') : '';
+        });
         setHeaderSamples(samples);
 
-        const initialMapping = generateAutoMatch(headers);
+        const initialMapping = autoMatch(headers);
         setMapping(initialMapping);
 
         // Genera anteprima iniziale
@@ -229,45 +99,35 @@ export default function App() {
     };
 
     if (extension === 'csv') {
-      // FIX: Tipizzare 'results' come 'any' per evitare errore TS7006
-      Papa.parse(file, {
+      Papa.parse<Row>(file, {
         header: true,
-        skipEmptyLines: true,
-        complete: (results: any) => parseCallback(results.data, results.meta.fields || [])
+        skipEmptyLines: 'greedy',
+        complete: (results) => parseCallback(results.data, (results.meta.fields || []).filter(f => f.trim() !== ''))
       });
     } else if (['xlsx', 'xls'].includes(extension || '')) {
       const reader = new FileReader();
       reader.onload = (evt) => {
-        const wb = XLSX.read(evt.target?.result, { type: 'binary' });
-        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
-        const headers = data.length > 0 ? Object.keys(data[0] as object) : [];
-        parseCallback(data, headers);
+        try {
+          const wb = XLSX.read(evt.target?.result as ArrayBuffer, { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          // Intestazioni lette dalla prima riga, così compaiono anche le colonne vuote nei primi record
+          const headerRow = (XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, blankrows: false })[0] || [])
+            .map(h => String(h ?? '').trim()).filter(h => h !== '');
+          // raw: true -> date come numero seriale Excel, convertite poi in AAAA-MM-GG
+          const data = XLSX.utils.sheet_to_json<Row>(ws, { defval: '', raw: true, blankrows: false });
+          parseCallback(data, headerRow);
+        } catch {
+          setIsProcessing(false);
+          alert("Impossibile leggere il file Excel (protetto da password o danneggiato?).");
+        }
       };
-      reader.readAsBinaryString(file);
+      reader.readAsArrayBuffer(file);
     } else { setIsProcessing(false); alert("Formato non supportato."); }
   };
 
   const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; if (file) processFile(file); };
   const onDrag = (e: React.DragEvent, dragging: boolean) => { e.preventDefault(); setIsDragging(dragging); };
   const onDrop = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); const file = e.dataTransfer.files?.[0]; if (file) processFile(file); };
-
-  const generateAutoMatch = (headers: string[]) => {
-    const newMapping: Mapping = {};
-    DEMO_COLUMNS.forEach(col => {
-      const match = headers.find(h => {
-        const hLow = h.toLowerCase().trim();
-        const idLow = col.id.toLowerCase();
-        if (idLow === 'data_nascita' && (hLow.includes('nascita') || hLow.includes('birth'))) return true;
-        if (idLow === 'cap' && (hLow.includes('zip') || hLow.includes('postale'))) return true;
-        if (idLow === 'indirizzo' && (hLow.includes('via') || hLow.includes('address'))) return true;
-        return hLow === col.label.toLowerCase() || hLow === idLow ||
-          (col.id === 'email' && (hLow.includes('mail') || hLow.includes('e-mail'))) ||
-          (col.id === 'telefono' && (hLow.includes('tel') || hLow.includes('cel') || hLow.includes('phone')));
-      });
-      if (match) newMapping[col.id] = match;
-    });
-    return newMapping;
-  };
 
   const isMappingValid = () => !!(mapping['email'] || mapping['telefono']);
 
@@ -277,15 +137,30 @@ export default function App() {
   };
 
   // --- ESPORTAZIONE ---
-  const exportFile = () => {
+  const exportFile = (format: 'xlsx' | 'csv') => {
     const fullProcessed = processAllData(fileData, mapping);
 
     const now = new Date();
-    const ts = `${now.getFullYear()}${(now.getMonth()+1).toString().padStart(2,'0')}${now.getDate().toString().padStart(2,'0')}_${now.getHours()}${now.getMinutes()}`;
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(new Blob([Papa.unparse(fullProcessed)], { type: 'text/csv;charset=utf-8;' }));
-    link.download = `${customFileName}_${ts}.csv`;
-    link.click();
+    const p2 = (n: number) => n.toString().padStart(2, '0');
+    const ts = `${now.getFullYear()}${p2(now.getMonth()+1)}${p2(now.getDate())}_${p2(now.getHours())}${p2(now.getMinutes())}`;
+    const baseName = `${customFileName || 'importazione'}_${ts}`;
+
+    if (format === 'xlsx') {
+      // Stesso formato del modello "esempio_importazioni.xlsx": foglio "Foglio1", colonne nello stesso ordine
+      const ws = XLSX.utils.aoa_to_sheet(toXlsxCells(fullProcessed));
+      ws['!cols'] = DEMO_COLUMNS.map(c => ({ wch: Math.max(12, c.label.length + 2, c.id === 'email' ? 30 : 0) }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Foglio1');
+      XLSX.writeFile(wb, `${baseName}.xlsx`);
+    } else {
+      const link = document.createElement("a");
+      // BOM iniziale: Excel apre correttamente gli accenti
+      const csv = Papa.unparse({ fields: DEMO_COLUMNS.map(c => c.label), data: fullProcessed.map(r => DEMO_COLUMNS.map(c => r[c.label] ?? '')) });
+      link.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' }));
+      link.download = `${baseName}.csv`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    }
     setShowSuccessToast(true); setTimeout(() => setShowSuccessToast(false), 4000);
   };
 
@@ -295,6 +170,7 @@ export default function App() {
       case 'Contatti': return <ShieldCheck size={13} strokeWidth={2.25} />;
       case 'Indirizzo': return <MapPin size={13} strokeWidth={2.25} />;
       case 'Dettagli': return <Tag size={13} strokeWidth={2.25} />;
+      case 'Consensi': return <BadgeCheck size={13} strokeWidth={2.25} />;
       default: return null;
     }
   };
@@ -485,6 +361,21 @@ export default function App() {
                   </div>
                 )}
 
+                {/* CONTROLLI FORMATO IMPORTAZIONE */}
+                {(importStats.dateNonValide > 0 || importStats.consensiNonRiconosciuti > 0 || importStats.emailNonValide > 0) && (
+                  <div className="flex items-start gap-3 mb-5 bg-rust-light p-4 rounded-sm border border-rust/30">
+                    <AlertCircle size={20} className="text-rust mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="font-bold text-sm text-rust-dark">Valori da controllare prima dell'importazione</p>
+                      <ul className="text-sm text-ink-soft mt-1 leading-snug list-disc pl-4">
+                        {importStats.dateNonValide > 0 && <li><b>{importStats.dateNonValide}</b> date di nascita non riconosciute: lasciate come nel file originale.</li>}
+                        {importStats.consensiNonRiconosciuti > 0 && <li><b>{importStats.consensiNonRiconosciuti}</b> consensi con valore non riconosciuto: impostati a 0 (nessun consenso).</li>}
+                        {importStats.emailNonValide > 0 && <li><b>{importStats.emailNonValide}</b> email con formato non valido.</li>}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
                 {/* AVVISO ENCODING */}
                 {encodingWarning && (
                   <div className="flex items-start gap-3 mb-5 bg-rust-light p-4 rounded-sm border border-rust/30">
@@ -592,8 +483,8 @@ export default function App() {
                         {previewRows.map((r, i) => (
                           <tr key={i} className="hover:bg-stamp-light/30 transition-colors">
                             {DEMO_COLUMNS.map(c => (
-                              <td key={c.id} className={`px-5 py-3 whitespace-nowrap font-medium ${r[c.label] === '-' || r[c.label] === '' ? 'text-ink-soft/40 italic font-normal' : ''}`}>
-                                {r[c.label] || "—"}
+                              <td key={c.id} className={`px-5 py-3 whitespace-nowrap font-medium ${r[c.label] === '' || r[c.label] === undefined ? 'text-ink-soft/40 italic font-normal' : ''}`}>
+                                {r[c.label] === '' || r[c.label] === undefined ? "—" : String(r[c.label])}
                               </td>
                             ))}
                           </tr>
@@ -617,10 +508,16 @@ export default function App() {
               <input type="text" value={customFileName} onChange={(e) => setCustomFileName(e.target.value)} className="w-full bg-paper-dark border border-ink/20 rounded-sm px-3 py-2 text-sm font-semibold text-ink outline-none focus:border-stamp" placeholder="Nome file..." />
             </div>
 
-            <button onClick={exportFile} disabled={!isMappingValid()} className={`w-full md:w-auto px-8 py-3.5 rounded-sm font-bold text-paper transition-all transform active:scale-[0.98] flex items-center justify-center gap-3 text-base
-              ${isMappingValid() ? 'bg-stamp hover:bg-stamp-dark shadow-[3px_3px_0_0_rgba(28,43,36,0.25)]' : 'bg-ink/25 cursor-not-allowed shadow-none'}`}>
-              <Download size={20} strokeWidth={2.25} /> Esporta CSV Pienissimo
-            </button>
+            <div className="flex self-stretch sm:self-auto gap-3">
+              <button onClick={() => exportFile('csv')} disabled={!isMappingValid()} className={`px-5 py-3.5 rounded-sm font-bold text-sm border-2 transition-all flex items-center justify-center gap-2
+                ${isMappingValid() ? 'border-ink/30 text-ink hover:border-stamp hover:text-stamp-dark' : 'border-ink/15 text-ink/30 cursor-not-allowed'}`}>
+                CSV
+              </button>
+              <button onClick={() => exportFile('xlsx')} disabled={!isMappingValid()} className={`flex-1 sm:flex-none whitespace-nowrap px-6 sm:px-8 py-3.5 rounded-sm font-bold text-paper transition-all transform active:scale-[0.98] flex items-center justify-center gap-3 text-base
+                ${isMappingValid() ? 'bg-stamp hover:bg-stamp-dark shadow-[3px_3px_0_0_rgba(28,43,36,0.25)]' : 'bg-ink/25 cursor-not-allowed shadow-none'}`}>
+                <Download size={20} strokeWidth={2.25} /> Esporta Excel Pienissimo
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -629,7 +526,7 @@ export default function App() {
         <p className="text-[10px] uppercase tracking-[0.2em] font-mono font-bold text-ink-soft/50 mb-1.5">Pienissimo Software · Strumento Interno</p>
         <p className="text-sm font-bold text-ink">Nicola Pellicioni</p>
         <p className="text-xs text-ink-soft mt-0.5">Responsabile Assistenza Tecnica</p>
-        <p className="text-[10px] mt-3 font-mono inline-block border border-ink/15 px-3 py-1 rounded-sm text-ink-soft/70">v1.1.0</p>
+        <p className="text-[10px] mt-3 font-mono inline-block border border-ink/15 px-3 py-1 rounded-sm text-ink-soft/70">v1.2.0</p>
       </footer>
     </div>
   );
